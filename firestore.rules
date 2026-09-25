@@ -1,0 +1,135 @@
+rules_version = '2';
+// Правила безопасности базы Forge-Frontal.
+// Вставить в Firebase Console → Firestore Database → Rules → Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn()  { return request.auth != null; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function myRole()    { return get(userPath(request.auth.uid)).data.role; }
+    function isStaff()   { return signedIn() && myRole() in ['Создатель', 'Техподдержка']; }
+    function isCreator() { return signedIn() && myRole() == 'Создатель'; }
+
+    // ---------- Профили: ник, роль, баланс монет ----------
+    // (почта и пароль хранятся в Firebase Authentication, не здесь)
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid)
+                  || isStaff()
+                  || resource.data.role in ['Создатель', 'Техподдержка'];   // список персонала виден всем
+
+      // игрок создаёт только свой профиль: роль «Игрок», баланс 0
+      allow create: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.keys().hasOnly(['nick', 'role', 'created', 'balance'])
+                    && request.resource.data.role == 'Игрок'
+                    && request.resource.data.balance == 0
+                    && request.resource.data.nick is string
+                    && request.resource.data.nick.matches('^[A-Za-z0-9_]{3,16}$')
+                    && request.resource.data.created == request.time
+                    && getAfter(/databases/$(database)/documents/nicks/$(request.resource.data.nick.lower())).data.uid == uid;
+
+      // создатель: меняет роль и баланс
+      allow update: if isCreator()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'balance'])
+                    && request.resource.data.role in ['Игрок', 'Техподдержка', 'Создатель']
+                    && request.resource.data.get('balance', 0) is int
+                    && request.resource.data.get('balance', 0) >= 0;
+
+      // игрок: списание монет при покупке — ровно на сумму нового заказа
+      allow update: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'lastOrder'])
+                    && isValidPurchase(uid);
+
+      allow delete: if false;
+    }
+
+    function isValidPurchase(uid) {
+      return request.resource.data.lastOrder is string
+          && !exists(/databases/$(database)/documents/orders/$(request.resource.data.lastOrder))
+          && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrder)).data.uid == uid
+          && request.resource.data.balance is int
+          && request.resource.data.balance >= 0
+          && request.resource.data.balance == resource.data.get('balance', 0)
+               - getAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrder)).data.total;
+    }
+
+    // ---------- Занятые ники (уникальность) ----------
+    match /nicks/{nickLower} {
+      allow read: if true;
+      allow create: if signedIn()
+                    && request.resource.data.keys().hasOnly(['uid'])
+                    && request.resource.data.uid == request.auth.uid
+                    && getAfter(userPath(request.auth.uid)).data.nick.lower() == nickLower;
+      allow update, delete: if false;
+    }
+
+    // ---------- Товары магазина ----------
+    match /shop/{itemId} {
+      allow read: if true;
+      allow create, update: if isCreator()
+                    && request.resource.data.keys().hasOnly(['name', 'icon', 'category', 'price', 'desc', 'order'])
+                    && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 60
+                    && request.resource.data.price is int && request.resource.data.price > 0 && request.resource.data.price <= 1000000;
+      allow delete: if isCreator();
+    }
+
+    // ---------- Заказы ----------
+    match /orders/{orderId} {
+      allow read: if isStaff() || (signedIn() && resource.data.uid == request.auth.uid);
+
+      // заказ создаётся только вместе со списанием монет (одним пакетом)
+      allow create: if signedIn()
+                    && request.resource.data.keys().hasOnly(['uid', 'nick', 'itemId', 'itemName', 'qty', 'price', 'total', 'status', 'created'])
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.nick == get(userPath(request.auth.uid)).data.nick
+                    && exists(/databases/$(database)/documents/shop/$(request.resource.data.itemId))
+                    && request.resource.data.price == get(/databases/$(database)/documents/shop/$(request.resource.data.itemId)).data.price
+                    && request.resource.data.qty is int && request.resource.data.qty >= 1 && request.resource.data.qty <= 64
+                    && request.resource.data.total == request.resource.data.price * request.resource.data.qty
+                    && request.resource.data.status == 'Ожидает выдачи'
+                    && request.resource.data.created == request.time
+                    && getAfter(userPath(request.auth.uid)).data.lastOrder == orderId
+                    && getAfter(userPath(request.auth.uid)).data.balance
+                         == get(userPath(request.auth.uid)).data.get('balance', 0) - request.resource.data.total;
+
+      // создатель выдаёт товар/донат бесплатно (из админ-приложения)
+      allow create: if isCreator()
+                    && request.resource.data.keys().hasOnly(['uid', 'nick', 'itemId', 'itemName', 'qty', 'price', 'total', 'status', 'created', 'free', 'givenBy', 'note'])
+                    && request.resource.data.free == true
+                    && request.resource.data.price == 0 && request.resource.data.total == 0
+                    && request.resource.data.qty is int && request.resource.data.qty >= 1 && request.resource.data.qty <= 64
+                    && request.resource.data.itemName is string && request.resource.data.itemName.size() > 0 && request.resource.data.itemName.size() <= 80
+                    && exists(userPath(request.resource.data.uid))
+                    && request.resource.data.givenBy == get(userPath(request.auth.uid)).data.nick
+                    && request.resource.data.status == 'Ожидает выдачи'
+                    && request.resource.data.created == request.time;
+
+      // персонал меняет статус (выдано / отменено)
+      allow update: if isStaff()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+                    && request.resource.data.status in ['Ожидает выдачи', 'Выдано', 'Отменено'];
+
+      allow delete: if false;
+    }
+
+    // ---------- Обращения в техподдержку ----------
+    match /tickets/{id} {
+      allow read: if isStaff();
+
+      allow create: if signedIn()
+                    && request.resource.data.keys().hasOnly(['uid', 'author', 'email', 'topic', 'message', 'status', 'created'])
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.author == get(userPath(request.auth.uid)).data.nick
+                    && request.resource.data.status == 'Ожидает ответа'
+                    && request.resource.data.created == request.time
+                    && request.resource.data.email is string && request.resource.data.email.size() <= 120
+                    && request.resource.data.topic is string && request.resource.data.topic.size() <= 120
+                    && request.resource.data.message is string && request.resource.data.message.size() <= 3000;
+
+      allow update: if isStaff()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+                    && request.resource.data.status in ['Ожидает ответа', 'Закрыто'];
+
+      allow delete: if isCreator();
+    }
+  }
+}
